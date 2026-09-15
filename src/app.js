@@ -16,6 +16,8 @@ const { Store } = require("./store");
 const { SearchEngine } = require("./search");
 const { CheckpointManager } = require("./checkpoint");
 
+// 对外公布的路由清单必须与旧版完全一致（/health、404 都引用它），
+// 旧客户端按固定字段与固定 11 条路由解析，不能把新增接口混进去。
 const routes = [
   "GET /health",
   "GET /rubbings",
@@ -27,7 +29,12 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete",
+  "POST /batches/:id/complete"
+];
+
+// 服务实际支持的全部路由（仅内部使用，如管理接口文档）。
+const allRoutes = [
+  ...routes,
   "GET /search?q=&code=&source=&damageType=&dateFrom=&dateTo=&kind=&pageSize=&cursor=&sessionId=",
   "GET /admin/search/status",
   "POST /admin/search/reindex"
@@ -85,7 +92,9 @@ async function createApp({ dataDir } = {}) {
   }
 
   function enrichBatch(batch) {
-    const damages = store.data.damages.filter((item) => batch.damageIds.includes(item.id));
+    // 用缺损 id 映射 O(1) 取项，避免每批次全表 filter（大数据量下 O(批次×缺损)）。
+    const byId = engine._byId.damages;
+    const damages = batch.damageIds.map((id) => byId.get(id)).filter(Boolean);
     return {
       ...batch,
       damages,
@@ -101,16 +110,8 @@ async function createApp({ dataDir } = {}) {
     const p = url.searchParams;
 
     if (req.method === "GET" && pathname === "/health") {
-      return send(res, 200, {
-        ok: true,
-        service: "rubbing-repair-api",
-        routes,
-        counts: {
-          rubbings: store.data.rubbings.length,
-          damages: store.data.damages.length,
-          batches: store.data.batches.length
-        }
-      });
+      // 与旧版逐字段一致：仅 ok / service / routes，且 routes 为原有 11 条。
+      return send(res, 200, { ok: true, service: "rubbing-repair-api", routes });
     }
 
     /* ---------------- 统一检索 ---------------- */
@@ -126,7 +127,7 @@ async function createApp({ dataDir } = {}) {
       };
       const page = {
         pageSize: p.get("pageSize") ? Number(p.get("pageSize")) : undefined,
-        cursor: p.get("cursor") ? Number(p.get("cursor")) : undefined,
+        cursor: p.get("cursor") || undefined, // 不透明 keyset 游标（base64url），保持字符串
         sessionId: p.get("sessionId") || undefined
       };
       const out = engine.searchPaged(query, page);
@@ -157,13 +158,17 @@ async function createApp({ dataDir } = {}) {
 
     /* ---------------- 拓片 ---------------- */
     if (req.method === "GET" && pathname === "/rubbings") {
+      // 一次遍历统计每个拓片的缺损数，避免 O(拓片×缺损) 嵌套。
+      const counts = new Map();
+      for (const d of store.data.damages) {
+        const c = counts.get(d.rubbingId) || { total: 0, pending: 0 };
+        c.total += 1;
+        if (d.status !== "repaired") c.pending += 1;
+        counts.set(d.rubbingId, c);
+      }
       const data = store.data.rubbings.map((rubbing) => {
-        const damages = store.data.damages.filter((item) => item.rubbingId === rubbing.id);
-        return {
-          ...rubbing,
-          damageCount: damages.length,
-          pendingDamages: damages.filter((item) => item.status !== "repaired").length
-        };
+        const c = counts.get(rubbing.id) || { total: 0, pending: 0 };
+        return { ...rubbing, damageCount: c.total, pendingDamages: c.pending };
       });
       return send(res, 200, { data });
     }

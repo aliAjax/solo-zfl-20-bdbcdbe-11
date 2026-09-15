@@ -76,6 +76,58 @@ test("组合查询：编号 + 来源 + 病害类型 + 时间范围", async () =>
   });
 });
 
+test("时间范围只按登记时间：六月登记、九月修好的缺损不出现在九月区间", async () => {
+  await withEngine(async ({ engine, store }) => {
+    await store.mutate([
+      "upsertDamage",
+      {
+        id: "dJune",
+        rubbingId: "r1",
+        position: "六月登记项",
+        type: "水渍",
+        beforePhotoUrl: "",
+        afterPhotoUrl: "a",
+        status: "repaired",
+        repairNote: "九月修好",
+        batchId: null,
+        createdAt: "2026-06-10T00:00:00.000Z",
+        repairedAt: "2026-09-20T00:00:00.000Z"
+      }
+    ]);
+
+    const sept = engine.search({ damageType: "水渍", dateFrom: "2026-09-01", dateTo: "2026-09-30" });
+    assert.strictEqual(sept.total, 0, "修复时间在九月也不应落入九月查询区间");
+
+    const june = engine.search({ damageType: "水渍", dateFrom: "2026-06-01", dateTo: "2026-06-30" });
+    assert.deepStrictEqual(june.results.map((x) => x.id), ["dJune"], "按登记时间六月应命中");
+
+    // 自由词同理：九月区间里不应因 repairedAt 命中
+    const septAll = engine.search({ q: "六月登记项", dateFrom: "2026-09-01", dateTo: "2026-09-30" });
+    assert.strictEqual(septAll.total, 0);
+  });
+});
+
+test("时间范围只按登记时间：批次的完成时间不参与区间判定", async () => {
+  await withEngine(async ({ engine, store }) => {
+    await store.mutate([
+      "upsertBatch",
+      {
+        id: "bJune",
+        name: "六月批次九月完成",
+        status: "completed",
+        damageIds: [],
+        note: "",
+        createdAt: "2026-06-15T00:00:00.000Z",
+        completedAt: "2026-09-25T00:00:00.000Z"
+      }
+    ]);
+    const sept = engine.search({ q: "六月批次", dateFrom: "2026-09-01", dateTo: "2026-09-30" });
+    assert.strictEqual(sept.total, 0, "完成时间不应把批次拉进九月区间");
+    const june = engine.search({ q: "六月批次", dateFrom: "2026-06-01", dateTo: "2026-06-30" });
+    assert.strictEqual(june.total, 1);
+  });
+});
+
 test("错一个字仍命中，结果标明命中原因（fuzzy + distance + window）", async () => {
   await withEngine(({ engine }) => {
     const r = engine.search({ q: "蟲柱孔" }); // 繁体 + 错字「柱」

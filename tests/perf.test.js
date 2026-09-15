@@ -65,7 +65,8 @@ for (const c of CASES) {
 test(`[perf] ${N} 条下分页切片亚秒且不重不漏`, async () => {
   const { index, db } = await getIndex();
   const { SearchEngine } = require("../src/search");
-  const engine = new SearchEngine(Object.assign(new EventEmitter(), { data: db }));
+  const store = Object.assign(new EventEmitter(), { data: db, seq: 1 });
+  const engine = new SearchEngine(store);
   engine.current = index;
   const t0 = Date.now();
   const p1 = engine.searchPaged({ q: "虫蛀孔" }, { pageSize: 100 });
@@ -74,5 +75,8 @@ test(`[perf] ${N} 条下分页切片亚秒且不重不漏`, async () => {
   assert.ok(elapsed <= 1000, `两次分页合计 ${elapsed}ms 超过 1000ms`);
   const a = new Set(p1.data.map((d) => d.id));
   assert.strictEqual(p2.data.filter((d) => a.has(d.id)).length, 0, "相邻页不得重复");
+  assert.ok(typeof p1.page.nextCursor === "string", "游标应为不透明字符串");
+  // 会话不得持有结果数组
+  assert.strictEqual(engine.sessions.get(p1.page.sessionId).items, undefined);
   engine.close();
 });

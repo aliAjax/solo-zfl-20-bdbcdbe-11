@@ -42,7 +42,7 @@ function buildDoc(record, kind, db) {
       damageType: "",
       name: record.note || "",
       other: [record.paperSize].filter(Boolean).join(" "),
-      dates: [record.createdAt].filter(Boolean),
+      // 时间范围只认登记时间，修复完成时间不参与。
       createdAt: record.createdAt || ""
     };
   }
@@ -57,7 +57,6 @@ function buildDoc(record, kind, db) {
       damageType: record.type || "",
       name: record.position || "",
       other: [record.repairNote, record.status].filter(Boolean).join(" "),
-      dates: [record.createdAt, record.repairedAt].filter(Boolean),
       createdAt: record.createdAt || "",
       rubbingId: record.rubbingId || null
     };
@@ -72,8 +71,15 @@ function buildDoc(record, kind, db) {
     damageType: "",
     name: record.name || "",
     other: [record.note, record.status].filter(Boolean).join(" "),
-    dates: [record.createdAt, record.completedAt].filter(Boolean),
     createdAt: record.createdAt || ""
+  };
+}
+
+/** 深拷贝索引条目（doc 与字段），使历史版本脱离 store 的就地 Object.assign 引用。 */
+function cloneIndexEntry(entry) {
+  return {
+    doc: { ...entry.doc },
+    fields: entry.fields.map((f) => ({ key: f.key, weight: f.weight, raw: f.raw, fi: f.fi }))
   };
 }
 
@@ -149,6 +155,87 @@ class SearchIndex {
 }
 
 /**
+ * 短窗口多版本历史：只保存「最老活动分页会话建立之后」被改动记录的版本。
+ *
+ * - 占用只与会话存活期间的写入量有关，与任何查询的结果条数无关；
+ * - 会话全部过期/结束后整体清空；
+ * - 每个 key 首次被捕获时写一条 label=0 的「边界版本」（变更前状态，对所有更早
+ *   seq 生效），之后每次变更在 label=seq 写新版本；
+ * - snapshot = {entry（索引条目，深拷贝）, record（完整业务记录，深拷贝）}，
+ *   entry 为 null 表示该时刻 key 不存在。
+ */
+class RecordHistory {
+  constructor() {
+    this.versions = new Map(); // key -> [{seq:0|n, snapshot}]
+  }
+
+  /** 首次见到 key 时记录其「变更前」状态，作为覆盖更早所有 seq 的边界。 */
+  captureBoundary(key, snapshot) {
+    if (this.versions.has(key)) return;
+    this.versions.set(key, [{ seq: 0, snapshot }]);
+  }
+
+  /** 记录一次变更（label=seq）后的新状态。 */
+  captureAfter(seq, key, snapshot) {
+    let list = this.versions.get(key);
+    if (!list) {
+      list = [];
+      this.versions.set(key, list);
+    }
+    const last = list[list.length - 1];
+    if (last && last.seq === seq) return;
+    list.push({ seq, snapshot });
+  }
+
+  isEmpty() {
+    return this.versions.size === 0;
+  }
+
+  dirtyKeys() {
+    return this.versions.keys();
+  }
+
+  /**
+   * 返回 key 在 seq 时刻的快照：
+   *   {snapshot:{entry,record}} 该时刻状态（entry 可能为 null 表示不存在）
+   *   null                      历史窗口内该 key 从未变化（应回退到当前数据）
+   */
+  stateAt(key, seq) {
+    const list = this.versions.get(key);
+    if (!list) return null;
+    let chosen = null;
+    for (const v of list) {
+      if (v.seq <= seq && (!chosen || v.seq >= chosen.seq)) chosen = v;
+    }
+    return chosen ? { snapshot: chosen.snapshot } : { snapshot: null };
+  }
+
+  /**
+   * 裁剪窗口到最老活动会话 floorSeq：
+   * 保留所有 seq>=floor 的新版本，外加 floor 之前的最近一个版本
+   * （即 floor 时刻应看到的状态，可能是边界版本 label=0）。
+   */
+  prune(floorSeq) {
+    for (const [key, list] of this.versions) {
+      if (list.length === 0) {
+        this.versions.delete(key);
+        continue;
+      }
+      const before = list.filter((v) => v.seq < floorSeq);
+      const atOrAfter = list.filter((v) => v.seq >= floorSeq);
+      const boundary = before.length ? [before[before.length - 1]] : [];
+      const merged = boundary.concat(atOrAfter);
+      if (merged.length === 0) this.versions.delete(key);
+      else this.versions.set(key, merged);
+    }
+  }
+
+  clear() {
+    this.versions.clear();
+  }
+}
+
+/**
  * 搜索引擎。持有「当前代」索引，重建时产生新代并原子替换。
  */
 class SearchEngine {
@@ -171,7 +258,8 @@ class SearchEngine {
       writable: true,
       configurable: true
     });
-    this.sessions = new Map();
+    this.sessions = new Map(); // sessionId -> {seq, query, total?, expiresAt}，O(1) 大小，与结果条数无关
+    this.history = new RecordHistory(); // 仅保存「活动分页会话期间」被改动记录的旧版本
     this._rebuildPromise = null;
     // 周期性清理过期分页会话；unref 让定时器不阻止进程退出。
     this._sessionTimer = setInterval(() => this.cleanupSessions(), 60 * 1000);
@@ -204,6 +292,71 @@ class SearchEngine {
       if (this._pending) this._cascadeRubbingChange(this._pending, op);
     };
     this.store.on("change", this._applyStoreChange);
+
+    // 多版本历史：变更前记「边界版本」（仅首次，label=0，覆盖更早所有 seq），
+    // 变更后记新版本（label=seq）。只有存在活动分页会话时才捕获，
+    // 成本只与写入量有关，与查询结果条数无关。
+    this._captureBeforeChange = ({ op }) => {
+      if (this.sessions.size === 0) return;
+      this._pendingHistoryKeys = this._affectedKeys(op);
+      for (const key of this._pendingHistoryKeys) {
+        const cur = this.current.docs.get(key);
+        this.history.captureBoundary(key, {
+          entry: cur ? cloneIndexEntry(cur) : null,
+          record: this._recordForKey(key)
+        });
+      }
+    };
+    this._captureAfterChange = ({ seq, op }) => {
+      if (this.sessions.size === 0) {
+        this._pendingHistoryKeys = null;
+        return;
+      }
+      const keys = this._pendingHistoryKeys || this._affectedKeys(op);
+      for (const key of keys) {
+        const cur = this.current.docs.get(key); // change 处理后已是新状态
+        this.history.captureAfter(seq, key, {
+          entry: cur ? cloneIndexEntry(cur) : null,
+          record: this._recordForKey(key)
+        });
+      }
+      this._pendingHistoryKeys = null;
+    };
+    this.store.on("prechange", this._captureBeforeChange);
+    this.store.on("change", this._captureAfterChange);
+  }
+
+  _recordForKey(key) {
+    const list = keyToList(key);
+    const r = this._byId[list].get(stripKey(key));
+    return r ? cloneRecord(r) : null;
+  }
+
+  /** 计算一次变更涉及的索引 key（含拓片编号/来源变更级联到的缺损）。 */
+  _affectedKeys(op) {
+    const subOps = op[0] === "bulk" ? op[1] : [op];
+    const kindOf = {
+      upsertRubbing: "rubbing",
+      upsertDamage: "damage",
+      upsertBatch: "batch",
+      deleteRubbing: "rubbing",
+      deleteDamage: "damage",
+      deleteBatch: "batch"
+    };
+    const upsert = new Set(["upsertRubbing", "upsertDamage", "upsertBatch"]);
+    const keys = new Set();
+    for (const [t, recOrId] of subOps) {
+      if (kindOf[t]) {
+        const ident = upsert.has(t) ? recOrId.id : recOrId;
+        keys.add(`${kindOf[t]}:${ident}`);
+      }
+      if (t === "upsertRubbing" && recOrId && ("code" in recOrId || "source" in recOrId)) {
+        for (const d of this.store.data.damages) {
+          if (d.rubbingId === recOrId.id) keys.add(`damage:${d.id}`);
+        }
+      }
+    }
+    return keys;
   }
 
   _cascadeRubbingChange(index, op) {
@@ -220,29 +373,27 @@ class SearchEngine {
   _applyOpToIndex(index, op) {
     const [type, ...args] = op;
     const db = this.store.data;
-    const kinds = {
-      upsertRubbing: "rubbings",
-      upsertDamage: "damages",
-      upsertBatch: "batches"
+    const kindOf = {
+      upsertRubbing: "rubbing",
+      upsertDamage: "damage",
+      upsertBatch: "batch"
     };
     if (type === "bulk") {
       for (const sub of args[0]) this._applyOpToIndex(index, sub);
       return;
     }
-    if (kinds[type]) {
+    if (kindOf[type]) {
       // upsert 的记录已在内存中（change 在 applyOp 之后触发），直接用传入记录建文档。
-      const kind = kinds[type].replace(/s$/, "");
-      index.addDoc(buildDoc(args[0], kind, db));
+      index.addDoc(buildDoc(args[0], kindOf[type], db));
       return;
     }
     const delKind = {
-      deleteRubbing: "rubbings",
-      deleteDamage: "damages",
-      deleteBatch: "batches"
+      deleteRubbing: "rubbing",
+      deleteDamage: "damage",
+      deleteBatch: "batch"
     }[type];
     if (delKind) {
-      const kind = delKind.replace(/s$/, "");
-      index.removeDoc(`${kind}:${args[0]}`);
+      index.removeDoc(`${delKind}:${args[0]}`);
     }
   }
 
@@ -389,31 +540,31 @@ class SearchEngine {
   }
 
   /**
-   * 查询入口（不分页，返回全部匹配）。HTTP 层通常调用 searchPaged。
+   * 查询入口（不分页，返回当前数据的全部匹配）。
    * @param {object} q 见 README：q/code/source/damageType/kind/dateFrom/dateTo
    */
   search(q = {}) {
-    const { hits, tookMs, generation } = this._collect(q);
-    const results = hits.map((h) => this._present(h));
-    return { results, total: results.length, tookMs, generation };
+    const t0 = Date.now();
+    const result = this._collect(q, this._liveSource());
+    const results = result.hits.map((h) => this._presentHit(h));
+    return { results, total: result.total, tookMs: Date.now() - t0, generation: this.current.generation };
   }
 
   /**
-   * 分页查询（会话式快照）。
+   * 分页查询（有界会话 + keyset 游标）。
    *
-   * 首次请求（无 sessionId）执行查询，把命中的有序「结果快照」存入会话；
-   * 之后翻页（带 sessionId + cursor）从同一份快照切片。
-   * 因此翻页期间数据有增改：同一查询既不会重复也不会漏项
-   * （新增项落在新查询里；删除项在会话中标记 isDeleted，不占位以外的影响）。
-   *
-   * @param {object} q 查询参数
-   * @param {object} page {sessionId?, cursor?, pageSize?}
+   * 会话只保存查询参数、seq 与游标（O(1)，与结果条数无关）；每页都在「会话建立时
+   * 那个 seq 的一致性视图」上重跑查询，用 keyset 游标定位窗口。因此：
+   *   - 常驻内存不随命中数增长；
+   *   - 翻页期间的增/删/改不影响本会话（视图由短窗口多版本历史回放），不重不漏；
+   *   - 新数据在新查询（新会话）中立即可见。
    */
   searchPaged(q = {}, page = {}) {
     const t0 = Date.now();
     const pageSize = clampPageSize(page.pageSize);
     let session = null;
     let created = false;
+
     if (page.sessionId) {
       session = this.sessions.get(page.sessionId);
       if (!session) {
@@ -421,52 +572,63 @@ class SearchEngine {
         err.status = 400;
         throw err;
       }
-    }
-    if (!session) {
-      const { hits, generation } = this._collect(q);
+      session.expiresAt = Date.now() + SESSION_TTL_MS; // 翻页即续期
+    } else {
       session = {
         id: makeSessionId(),
         createdAt: Date.now(),
         expiresAt: Date.now() + SESSION_TTL_MS,
-        query: normalizeQueryKey(q),
-        params: q,
-        generation,
-        items: hits.map((h) => ({
-          kind: h.doc.kind,
-          id: h.doc.id,
-          score: h.score,
-          reasons: h.reasons,
-          // 冗余稳定排序键与会话时刻字段，保证即使记录后来被删也不影响顺序
-          createdAt: h.doc.createdAt,
-          code: h.doc.code
-        }))
+        params: { ...q },
+        seq: this.store.seq, // 会话锚定的一致性版本
+        total: null
       };
       this.sessions.set(session.id, session);
       created = true;
     }
-    session.expiresAt = Date.now() + SESSION_TTL_MS; // 翻页即续期
 
-    const cursor = Number.isInteger(page.cursor) ? page.cursor : 0;
-    const start = Math.max(0, cursor);
-    const slice = session.items.slice(start, start + pageSize);
-    const results = slice.map((item, i) => {
-      const presented = this._presentItem(item);
-      presented.cursor = start + i;
-      return presented;
-    });
-    const nextCursor = start + pageSize;
+    const source = this._viewSource(session.seq);
+    const result = this._collect(session.params, source);
+
+    if (session.total === null) session.total = result.total;
+
+    // keyset 游标：上一页最后一条命中的唯一排序键（score, createdAt, code, id）。
+    let after = null;
+    if (page.cursor) {
+      try {
+        after = JSON.parse(Buffer.from(String(page.cursor), "base64url").toString("utf8"));
+      } catch {
+        const err = new Error("分页游标无法解析，请重新发起查询");
+        err.status = 400;
+        throw err;
+      }
+    }
+
+    // 在已排序命中里跳过游标之前的项，取 pageSize+1 条判断是否还有下一页。
+    const window = [];
+    let startOffset = 0;
+    for (const [idx, h] of result.hits.entries()) {
+      if (after && !hitAfterTuple(h, after)) continue;
+      if (window.length === 0) startOffset = idx;
+      window.push(h);
+      if (window.length > pageSize) break;
+    }
+    const hasMore = window.length > pageSize;
+    const pageHits = window.slice(0, pageSize);
+    const last = pageHits[pageHits.length - 1];
+
+    const data = pageHits.map((h) => this._presentHit(h, source));
     return {
-      data: results,
-      total: session.items.length,
+      data,
+      total: session.total,
       tookMs: Date.now() - t0,
-      generation: session.generation,
+      generation: this.current.generation,
       page: {
         sessionId: session.id,
         pageSize,
-        cursor: start,
-        nextCursor: nextCursor < session.items.length ? nextCursor : null,
-        hasMore: nextCursor < session.items.length,
-        index: Math.floor(start / pageSize) + 1
+        cursor: page.cursor || null,
+        nextCursor: hasMore && last ? encodeCursor(last) : null,
+        hasMore,
+        index: Math.floor(startOffset / pageSize) + 1
       },
       sessionCreated: created
     };
@@ -474,21 +636,76 @@ class SearchEngine {
 
   endSession(sessionId) {
     if (sessionId) this.sessions.delete(sessionId);
+    this._pruneHistory();
   }
 
   cleanupSessions(now = Date.now()) {
+    let removed = false;
     for (const [id, s] of this.sessions) {
-      if (s.expiresAt <= now) this.sessions.delete(id);
+      if (s.expiresAt <= now) {
+        this.sessions.delete(id);
+        removed = true;
+      }
     }
+    if (removed) this._pruneHistory();
+  }
+
+  /** 会话清理后裁剪历史：只保留「最老活动会话 seq」之后需要的版本。 */
+  _pruneHistory() {
+    if (this.sessions.size === 0) {
+      this.history.clear();
+      return;
+    }
+    let floor = Infinity;
+    for (const s of this.sessions.values()) floor = Math.min(floor, s.seq);
+    this.history.prune(floor);
+  }
+
+  /** 当前数据的查询源（无版本回溯）。 */
+  _liveSource() {
+    const byId = this._byId;
+    return {
+      seq: Infinity, // 当前数据：历史兜底永不命中（stateAt 对 Infinity 恒取最新版本）
+      index: this.current,
+      entryAt: (key) => {
+        const e = this.current.docs.get(key);
+        if (!e) return null;
+        const list = keyToList(key);
+        const id = stripKey(key);
+        return { entry: e, record: byId[list].get(id) || null };
+      }
+    };
+  }
+
+  /** 指定 seq 的一致性视图查询源：命中索引条目与记录都回到该版本。 */
+  _viewSource(seq) {
+    const byId = this._byId;
+    return {
+      seq,
+      index: this.current,
+      entryAt: (key) => {
+        const st = this.history.stateAt(key, seq);
+        if (!st) {
+          // 该 key 在历史窗口内未变：当前状态即 seq 状态。
+          const e = this.current.docs.get(key);
+          if (!e) return null;
+          return { entry: e, record: byId[keyToList(key)].get(stripKey(key)) || null };
+        }
+        const snap = st.snapshot;
+        if (!snap || !snap.entry) return null; // 该版本下不存在（之后插入 / 当时已删）
+        return { entry: snap.entry, record: snap.record };
+      }
+    };
   }
 
   /**
-   * 执行一次查询，返回未呈现、已排序的命中列表。
-   * 纯计算、同步（倒排 + 滑窗均为内存操作），十万级数据亚秒完成。
+   * 执行一次查询。source 决定取哪个版本的数据（当前 / 会话 seq 视图）。
+   * 同步纯计算；候选来自当前倒排（倒排只是超集召回，最终以视图条目复核命中与评分）。
    */
-  _collect(q = {}) {
+  _collect(q = {}, source) {
+    if (!source) source = this._liveSource();
     const t0 = Date.now();
-    const index = this.current; // 查询期间固定世代：并发重建/写入都不换表
+    const index = this.current; // 倒排召回固定当前世代（含全部历史/当前 key 的 gram）
     const kinds = parseKinds(q.kind);
     const dateFrom = q.dateFrom ? Date.parse(q.dateFrom) : null;
     const dateTo = q.dateTo ? Date.parse(q.dateTo) : null;
@@ -521,8 +738,11 @@ class SearchEngine {
       else for (const k of candidates) if (!set.has(k)) candidates.delete(k);
     };
     const fieldHasGram = (docKey, fieldName, g) => {
-      const entry = index.docs.get(docKey);
-      return !!(entry && entry.fields.some((f) => f.key === fieldName && f.fi.grams.has(g)));
+      const cur = index.docs.get(docKey);
+      // 视图条目与当前条目任一含该 gram 即作为候选（后续按视图条目严格复核）。
+      const view = source.entryAt(docKey);
+      const inEntry = (e) => !!(e && e.fields.some((f) => f.key === fieldName && f.fi.grams.has(g)));
+      return inEntry(cur) || (view && inEntry(view.entry));
     };
     const addSegmentCandidates = (norm, fieldKey) => {
       const { latin, cjk } = segments(norm);
@@ -530,7 +750,6 @@ class SearchEngine {
         ...latin.map((t) => ({ type: "latin", grams: [t] })),
         ...cjk.map((c) => {
           if (c.length === 1) return { type: "cjk", grams: [c] };
-          // bigram 为主（AND 召回仍精确），另加首尾 unigram 覆盖边界错字。
           const chars = [...c];
           const grams = [];
           for (let i = 0; i < chars.length - 1; i++) grams.push(chars[i] + chars[i + 1]);
@@ -543,11 +762,20 @@ class SearchEngine {
         for (const g of seg.grams) {
           const posting = index.postings.get(g);
           if (!posting) continue;
-          if (!fieldKey) {
-            for (const key of posting.keys()) union.add(key);
-          } else {
-            for (const key of posting.keys()) if (fieldHasGram(key, fieldKey, g)) union.add(key);
+          for (const key of posting.keys()) {
+            if (!fieldKey || fieldHasGram(key, fieldKey, g)) union.add(key);
           }
+        }
+        // 历史版本兜底：记录在会话之后被删除、或字段被改得不再含这些 gram 时，
+        // 当前倒排已召回不到它，但会话视图仍应包含。扫描多版本历史中的脏键，
+        // 数量只与会话期间的写入量有关，与命中总数无关。
+        for (const dirtyKey of this.history.dirtyKeys()) {
+          const st = this.history.stateAt(dirtyKey, source.seq);
+          const e = st && st.snapshot ? st.snapshot.entry : null;
+          if (!e) continue;
+          if (fieldKey && !e.fields.some((f) => f.key === fieldKey && seg.grams.some((g) => f.fi.grams.has(g)))) continue;
+          if (!fieldKey && !e.fields.some((f) => seg.grams.some((g) => f.fi.grams.has(g)))) continue;
+          union.add(dirtyKey);
         }
         intersect(union);
         if (candidates && candidates.size === 0) break;
@@ -556,31 +784,36 @@ class SearchEngine {
 
     for (const fq of fieldQueries) addSegmentCandidates(fq.norm, fq.key);
     if (freeNorm) addSegmentCandidates(freeNorm, null);
-    if (candidates === null) candidates = index.allKeys();
+    if (candidates === null) {
+      // 无文本条件：以当前全部键 + 历史中该版本存在的脏键为候选。
+      candidates = index.allKeys();
+      for (const dirtyKey of this.history.dirtyKeys()) {
+        const st = this.history.stateAt(dirtyKey, source.seq);
+        if (st && st.snapshot && st.snapshot.entry) candidates.add(dirtyKey);
+      }
+    }
 
     const hits = [];
     for (const key of candidates) {
-      const entry = index.docs.get(key);
-      if (!entry) continue;
+      const view = source.entryAt(key);
+      if (!view || !view.entry) continue; // 该版本下不存在（会话建立后才新增）
+      const entry = view.entry;
       const doc = entry.doc;
       if (kinds && !kinds.has(doc.kind)) continue;
+      // 时间范围只按「登记时间」判定；修复/完成时间不参与。
       if (dateFrom !== null || dateTo !== null) {
-        const inRange = doc.dates.some((d) => {
-          const t = Date.parse(d);
-          if (Number.isNaN(t)) return false;
-          if (dateFrom !== null && t < dateFrom) return false;
-          if (dateTo !== null && t > dateTo) return false;
-          return true;
-        });
-        if (!inRange) continue;
+        const t = Date.parse(doc.createdAt);
+        if (Number.isNaN(t)) continue;
+        if (dateFrom !== null && t < dateFrom) continue;
+        if (dateTo !== null && t > dateTo) continue;
       }
       const match = this._scoreEntry(entry, fieldQueries, freeNorm, freeText);
       if (!match) continue;
-      hits.push({ doc, score: match.score, reasons: match.reasons });
+      hits.push({ key, doc, score: match.score, reasons: match.reasons, record: view.record });
     }
 
     hits.sort((a, b) => compareDocs(a, b));
-    return { hits, tookMs: Date.now() - t0, generation: index.generation };
+    return { hits, total: hits.length, tookMs: Date.now() - t0 };
   }
 
   _scoreEntry(entry, fieldQueries, freeNorm, freeText) {
@@ -662,61 +895,31 @@ class SearchEngine {
     return { score, reasons };
   }
 
-  _present(hit) {
-    return this._presentItem({
-      kind: hit.doc.kind,
-      id: hit.doc.id,
-      score: hit.score,
-      reasons: hit.reasons,
-      createdAt: hit.doc.createdAt,
-      code: hit.doc.code
-    });
-  }
-
-  /** 按会话快照项呈现当前数据；记录被删时保留占位并标记，保证翻页不重不漏。 */
-  _presentItem(item) {
-    const listName = { rubbing: "rubbings", damage: "damages", batch: "batches" }[item.kind];
-    const record = (this._byId[listName] && this._byId[listName].get(item.id)) || null;
-
+  /**
+   * 呈现一条命中。record 取自查询源的版本快照：
+   *   - live 源：当前记录；
+   *   - 会话视图源：会话 seq 时的记录（翻页期间被删则该命中在视图里不存在，不会到这里）。
+   */
+  _presentHit(hit) {
+    const doc = hit.doc;
+    const record = hit.record;
     const base = {
-      kind: item.kind,
-      kindLabel: KIND_LABEL[item.kind],
-      id: item.id,
-      code: item.code,
-      createdAt: item.createdAt,
-      score: item.score,
-      matchedReasons: item.reasons,
-      isDeleted: !record
+      kind: doc.kind,
+      kindLabel: KIND_LABEL[doc.kind],
+      id: doc.id,
+      code: doc.code,
+      source: doc.source,
+      damageType: doc.damageType,
+      name: doc.name,
+      createdAt: doc.createdAt,
+      score: hit.score,
+      matchedReasons: hit.reasons
     };
-
-    if (!record) {
-      base.stale = "该记录在本次查询会话建立后已被删除";
-      return base;
-    }
-
-    if (item.kind === "rubbing") {
-      Object.assign(base, {
-        code: record.code,
-        source: record.source,
-        name: record.note || "",
-        record
-      });
-    } else if (item.kind === "damage") {
-      const rub = this._byId.rubbings.get(record.rubbingId) || null;
-      Object.assign(base, {
-        code: rub ? rub.code : "",
-        source: rub ? rub.source : "",
-        damageType: record.type || "",
-        name: record.position || "",
-        record,
-        rubbing: rub ? { id: rub.id, code: rub.code, source: rub.source } : null
-      });
-    } else {
-      Object.assign(base, {
-        code: record.id,
-        name: record.name || "",
-        record
-      });
+    if (record) base.record = record;
+    if (doc.kind === "damage" && record) {
+      const rub = this._byId.rubbings.get(record.rubbingId);
+      // 视图里拓片可能已被改/删；以缺损文档冗余的 code/source 为准。
+      base.rubbing = rub ? { id: rub.id, code: doc.code, source: doc.source } : null;
     }
     return base;
   }
@@ -732,18 +935,40 @@ function clampPageSize(n) {
   return Math.min(MAX_PAGE_SIZE, Math.floor(v));
 }
 
+function keyToList(key) {
+  const kind = key.split(":")[0];
+  return { rubbing: "rubbings", damage: "damages", batch: "batches" }[kind];
+}
+function stripKey(key) {
+  return key.slice(key.indexOf(":") + 1);
+}
+
+function cloneRecord(r) {
+  return r ? JSON.parse(JSON.stringify(r)) : null;
+}
+
+/** 命中的唯一排序元组：score 降序，其后 createdAt/code/id 升序。 */
+function tupleOf(h) {
+  return { s: h.score, t: h.doc.createdAt || "", c: h.doc.code || "", i: h.doc.id };
+}
+
+/** h 是否严格排在游标 after 之后（即下一页应包含 h）。 */
+function hitAfterTuple(h, after) {
+  const t = tupleOf(h);
+  if (t.s !== after.s) return t.s < after.s; // 分数低的排后面
+  if (t.t !== after.t) return t.t > after.t;
+  if (t.c !== after.c) return t.c > after.c;
+  return t.i > after.i;
+}
+
+function encodeCursor(h) {
+  return Buffer.from(JSON.stringify(tupleOf(h)), "utf8").toString("base64url");
+}
+
 let SESSION_SEQ = 0;
 function makeSessionId() {
   SESSION_SEQ += 1;
   return `s_${Date.now().toString(36)}_${SESSION_SEQ.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-/** 规范化查询参数为可缓存键（仅用于会话展示，不参与判定）。 */
-function normalizeQueryKey(q) {
-  const keys = ["q", "code", "source", "damageType", "kind", "dateFrom", "dateTo"];
-  const out = {};
-  for (const k of keys) if (q[k] !== undefined) out[k] = String(q[k]);
-  return out;
 }
 
 function fieldLabel(key) {

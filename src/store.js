@@ -221,6 +221,10 @@ class Store extends EventEmitter {
       // 先持久化（append + fsync），再改内存 —— 崩溃也不丢已确认写入。
       await this._walFh.appendFile(line);
       await this._walFh.sync();
+      // 应用变更「之前」同步发出事件：此时 this.data 仍是旧状态，
+      // 供订阅者（多版本索引）捕获被覆盖/删除记录的旧版本。
+      // 与下方 applyOp 之间没有 await，且写入串行，事件里看到的数据与变更严格相邻。
+      this.emit("prechange", { seq, op: bulkOp, data: this.data });
       applyOp(this.data, bulkOp);
       this.emit("change", { seq, op: bulkOp, data: this.data });
       // 压实不能在写链运行中同步等待（会与链尾新写入形成并发），

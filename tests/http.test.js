@@ -27,12 +27,33 @@ async function withServer(fn) {
   }
 }
 
-test("健康检查", async () => {
+const LEGACY_HEALTH = {
+  ok: true,
+  service: "rubbing-repair-api",
+  routes: [
+    "GET /health",
+    "GET /rubbings",
+    "POST /rubbings",
+    "GET /rubbings/:id/damages",
+    "POST /rubbings/:id/damages",
+    "GET /damages?status=&type=",
+    "PATCH /damages/:id",
+    "GET /batches",
+    "POST /batches",
+    "GET /batches/:id",
+    "POST /batches/:id/complete"
+  ]
+};
+
+test("健康检查：与旧版逐字段一致（字段、路由清单都不变）", async () => {
   await withServer(async (base) => {
     const { status, body } = await json(`${base}/health`);
     assert.strictEqual(status, 200);
-    assert.strictEqual(body.ok, true);
-    assert.ok(body.routes.some((r) => r.startsWith("GET /search")));
+    assert.deepStrictEqual(body, LEGACY_HEALTH);
+    // 明确保证：新增路由不出现在健康检查里，也不多任何字段
+    assert.strictEqual(body.counts, undefined);
+    assert.ok(!body.routes.some((r) => r.includes("/search") || r.includes("/admin")));
+    assert.deepStrictEqual(Object.keys(body), ["ok", "service", "routes"]);
   });
 });
 
