@@ -22,3 +22,10 @@ Thumbs.db
 .vscode/
 
 *.log
+
+# 检索服务运行数据
+data-perf/
+data/snapshot.json
+data/wal.log
+data/wal.corrupt
+data/rebuild-checkpoint.json
